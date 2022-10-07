@@ -7,9 +7,17 @@ from torch import transpose as t
 from torch import inverse as inv
 from torch import mm,solve,matmul
 
+# class AdjustLayer(nn.Module):
+#     def __init__(self, init_scale=0.4, num_adjust=None, init_bias=0, base=1):
+#         super().__init__()
+#         self.scale = nn.Parameter(torch.FloatTensor([init_scale for i in range(num_adjust)]).unsqueeze(1))
+#         self.bias = nn.Parameter(torch.FloatTensor([init_bias for i in range(num_adjust)]).unsqueeze(1))
+
+#     def forward(self, x, num_samples):
+#         return x * (10**self.scale[num_samples-1]) + self.bias[num_samples-1]
 
 class AdjustLayer(nn.Module):
-    def __init__(self, init_scale=3, num_adjust=None, init_bias=0, base=1):
+    def __init__(self, init_scale=6, num_adjust=None, init_bias=0, base=1):
         super().__init__()
         self.scale = nn.Parameter(torch.FloatTensor([init_scale for i in range(num_adjust)]).unsqueeze(1))
         self.bias = nn.Parameter(torch.FloatTensor([init_bias for i in range(num_adjust)]).unsqueeze(1))
@@ -28,39 +36,27 @@ class RESUS_NN(nn.Module):
         self.adjust = AdjustLayer(num_adjust=COLD_USER_THRESHOLD)
         self.fc1 = nn.Linear(self.encoder.last_layer_dim+self.encoder.embedding_dim, 1)
 
-    def forward(self, feature_ids, feature_vals, support_data, debug=False):
-        # feature_ids: None*num_fields
-        # feature_vals: None*num_fields
-        # support_data: [x_id_support,x_val_support,y_support]
-        # x_id_support: None*COLD_USER_THRESHOLD*num_fields
-        # x_val_support: None*COLD_USER_THRESHOLD*num_fields
-        # y_support: None*COLD_USER_THRESHOLD
-        
-        x_id_support, x_val_support, y_support = support_data
-        feature_ids_concat = torch.cat([feature_ids.unsqueeze(1),x_id_support],dim=1) # None*(COLD_USER_THRESHOLD+1)*num_fields
-        feature_vals_concat = torch.cat([feature_vals.unsqueeze(1),x_val_support],dim=1) # None*(COLD_USER_THRESHOLD+1)*num_fields
-        feature_ids_concat = feature_ids_concat.view(-1,self.num_fields) # (None*(COLD_USER_THRESHOLD+1))*num_fields
-        feature_vals_concat = feature_vals_concat.view(-1,self.num_fields) # (None*(COLD_USER_THRESHOLD+1))*num_fields
-        output_predictor = self.predictor(feature_ids_concat, feature_vals_concat, return_hidden=False)
-        output_predictor = output_predictor.view(-1, self.COLD_USER_THRESHOLD+1) # None*(COLD_USER_THRESHOLD+1)
-        _, g_x_concat = self.encoder(feature_ids_concat, feature_vals_concat, return_hidden=True)
-        g_x_concat = g_x_concat.view(-1, self.COLD_USER_THRESHOLD+1, g_x_concat.shape[1]) # None*(COLD_USER_THRESHOLD+1)*hidden_size
-        g_x_hat = g_x_concat[:,[0],:] # None*1*hidden_size
-        g_x_support = g_x_concat[:,1:,:] # None*COLD_USER_THRESHOLD*hidden_size
-        num_samples = (y_support!=-1).sum(1) # None    
-        distance = torch.abs(g_x_hat-g_x_support) # None*COLD_USER_THRESHOLD*hidden_size
-        similar_score = self.fc1(distance).squeeze() # None*COLD_USER_THRESHOLD
-        support_mask = (y_support==-1) # None*COLD_USER_THRESHOLD
-        similar_score[support_mask] = float('-inf')
-        similar_score_normalized = nn.Softmax(dim=1)(similar_score*1) # None*COLD_USER_THRESHOLD 
-        delta_y = y_support-nn.Sigmoid()(output_predictor[:,1:]) #None*COLD_USER_THRESHOLD
-        delta_y_hat = (delta_y*similar_score_normalized).sum(1,keepdim=True) # None
-        prediction = self.adjust(delta_y_hat, num_samples) + output_predictor[:,[0]]        
-        if debug:
-            return X_nomask, X, y_support, nn.Sigmoid()(matmul(X, W)), matmul(X, delta_W), delta_W
-        else:
-            return prediction.squeeze()
-        
+    def forward(self, support_set, query_set):
+        # support_set: [x_id_support,x_val_support,y_support]
+        # x_id_support: 1*sup_size*num_fields
+        # x_val_support: 1*sup_size*num_fields
+        # y_support: 1*sup_size
+        support_set_x = [support_set[0][0],support_set[1][0]]
+        support_set_y = support_set[2] # 1*sup_size
+        query_set_x = [query_set[0][0],query_set[1][0]]
+        num_samples = support_set_y.shape[1]
+        _, support_set_encode = self.encoder(support_set_x[0],support_set_x[1], return_hidden=True) # sup_size*encode_dim
+        _, query_set_encode = self.encoder(query_set_x[0], query_set_x[1], return_hidden=True) # query_size*encode_dim
+        support_set_predict = self.predictor(support_set_x[0], support_set_x[1], return_hidden=False).unsqueeze(0) # 1*sup_size
+        query_set_predict = self.predictor(query_set_x[0], query_set_x[1], return_hidden=False) # query_size
+        distance = torch.abs(query_set_encode.unsqueeze(1)-support_set_encode.unsqueeze(0))  # query_size*sup_size*encode_dim
+        similar_score = self.fc1(distance).squeeze(2) # query_size*sup_size
+        similar_score_normalized = nn.Softmax(dim=1)(similar_score*1) # query_size*sup_size
+        delta_y = support_set_y-nn.Sigmoid()(support_set_predict) # 1*sup_size
+        delta_y_hat = (delta_y*similar_score_normalized).sum(1) # query_size
+        prediction = self.adjust(delta_y_hat, num_samples) + query_set_predict  # query_size
+        return prediction, torch.sqrt((distance ** 2).sum(-1)).mean(-1)
+
 
 class LambdaLayer(nn.Module):
     def __init__(self, learn_lambda=True, num_lambda=None, init_lambda=1, base=1):
@@ -73,7 +69,7 @@ class LambdaLayer(nn.Module):
         #   x: None*COLD*COLD
         #   n_samples: None
         return x * torch.abs(self.l.unsqueeze(1).unsqueeze(2))
-    
+
 # RR
 class RESUS_RR(nn.Module):
     def __init__(self, num_fields, COLD_USER_THRESHOLD, encoder, predictor):
@@ -84,9 +80,10 @@ class RESUS_RR(nn.Module):
         self.encoder = encoder
         self.lambda_rr = LambdaLayer(learn_lambda=True, num_lambda=COLD_USER_THRESHOLD)
         self.L = nn.CrossEntropyLoss()
-        self.adjust = AdjustLayer(1, num_adjust=COLD_USER_THRESHOLD)     
-        
+        self.adjust = AdjustLayer(num_adjust=COLD_USER_THRESHOLD)
+
     def rr_standard(self, x, n_samples, yrr_binary, linsys=False):
+        #         x /= n_samples
         I = torch.eye(x.shape[1]).to(x)
 
         if not linsys:
@@ -101,6 +98,7 @@ class RESUS_RR(nn.Module):
     def rr_woodbury(self, X, n_samples, yrr_binary, linsys=False):
         #   X: None*COLD_USER_THRESHOLD*(hidden_size+1)
         #   n_samples: None
+        #         x = X/torch.sqrt(n_samples.float()).unsqueeze(1).unsqueeze(2)    #   x: None*COLD*(hidden+1)
         x = X
         I = torch.eye(x.shape[1]).unsqueeze(0).repeat(x.shape[0],1,1).to(x)    # None*COLD*COLD
         if not linsys:
@@ -112,38 +110,26 @@ class RESUS_RR(nn.Module):
             w = mm(t_(x), w_)
         return w
 
-    def forward(self, feature_ids, feature_vals, support_data, debug=False):
-        # feature_ids: None*num_fields
-        # feature_vals: None*num_fields
-        # support_data: [x_id_support,x_val_support,y_support]
-        # x_id_support: None*COLD_USER_THRESHOLD*num_fields
-        # x_val_support: None*COLD_USER_THRESHOLD*num_fields
-        # y_support: None*COLD_USER_THRESHOLD
-        
-        x_id_support, x_val_support, y_support = support_data
-        feature_ids_concat = torch.cat([feature_ids.unsqueeze(1),x_id_support],dim=1) # None*(COLD_USER_THRESHOLD+1)*num_fields
-        feature_vals_concat = torch.cat([feature_vals.unsqueeze(1),x_val_support],dim=1) # None*(COLD_USER_THRESHOLD+1)*num_fields
-        feature_ids_concat = feature_ids_concat.view(-1,self.num_fields) # (None*(COLD_USER_THRESHOLD+1))*num_fields
-        feature_vals_concat = feature_vals_concat.view(-1,self.num_fields) # (None*(COLD_USER_THRESHOLD+1))*num_fields
-        output_predictor = self.predictor(feature_ids_concat, feature_vals_concat, return_hidden=False)
-        output_predictor = output_predictor.view(-1, self.COLD_USER_THRESHOLD+1) # None*(COLD_USER_THRESHOLD+1)
-        _, g_x_concat = self.encoder(feature_ids_concat, feature_vals_concat, return_hidden=True)
-        g_x_concat = g_x_concat.view(-1, self.COLD_USER_THRESHOLD+1, g_x_concat.shape[1]) # None*(COLD_USER_THRESHOLD+1)*hidden_size
-        g_x_hat = g_x_concat[:,[0],:] # None*1*hidden_size
-        g_x_support = g_x_concat[:,1:,:] # None*COLD_USER_THRESHOLD*hidden_size
-        # output_encoder
-        y_x_hat = output_predictor[:,0] # None
-        X_mask = (y_support!=-1).int().float().unsqueeze(2) # None*COLD_USER_THRESHOLD*1
-        num_samples = (y_support!=-1).sum(1) # None
-        ones = torch.ones((g_x_support.shape[0],g_x_support.shape[1])).unsqueeze(2).to(g_x_hat) # None*COLD_USER_THRESHOLD*1
-        X_nomask = torch.cat((g_x_support, ones), 2) # None*COLD_USER_THRESHOLD*(hidden_size+1)
-        X = X_nomask*X_mask 
-        delta_W = self.rr_woodbury(X, num_samples, y_support.unsqueeze(2)-nn.Sigmoid()(output_predictor[:,1:].unsqueeze(2))) # None*(hidden_size+1)*1    
-        delta_w = delta_W[:,:-1] # None*(hidden_size)*1     
-        delta_b = delta_W[:,-1] # None*1     
-        out = matmul(g_x_hat, delta_w).squeeze(2) + delta_b # None*1
-        prediction = self.adjust(out, num_samples) + output_predictor[:,[0]]
-        if debug:
-            return X_nomask, X, y_support, nn.Sigmoid()(matmul(X, W)), matmul(X, delta_W), delta_W
-        else:
-            return prediction.squeeze()
+    def forward(self, support_set, query_set):
+        # support_set: [x_id_support,x_val_support,y_support]
+        # x_id_support: 1*sup_size*num_fields
+        # x_val_support: 1*sup_size*num_fields
+        # y_support: 1*sup_size
+        support_set_x = [support_set[0][0],support_set[1][0]]
+        support_set_y = support_set[2] # 1*sup_size
+        query_set_x = [query_set[0][0],query_set[1][0]]
+        num_samples = support_set_y.shape[1]
+        _, support_set_encode = self.encoder(support_set_x[0],support_set_x[1], return_hidden=True) # sup_size*encode_dim
+        _, query_set_encode = self.encoder(query_set_x[0], query_set_x[1], return_hidden=True) # query_size*encode_dim
+        support_set_predict = self.predictor(support_set_x[0], support_set_x[1], return_hidden=False).unsqueeze(0) # 1*sup_size
+        query_set_predict = self.predictor(query_set_x[0], query_set_x[1], return_hidden=False) # query_size
+
+        ones = torch.ones((1,support_set_encode.shape[0],1)).to(support_set_encode) # 1*sup_size*1
+        support_set_encode_prime = torch.cat((support_set_encode.unsqueeze(0), ones), 2) # 1*sup_size*(encode_dim+1)
+        # 1*(encode_dim+1)*1
+        delta_W = self.rr_woodbury(support_set_encode_prime, num_samples, support_set_y.unsqueeze(2)-nn.Sigmoid()(support_set_predict.unsqueeze(2))) # None*(hidden_size+1)*1
+        delta_w = delta_W[0,:-1] # encode_dim*1
+        delta_b = delta_W[0,-1] # 1
+        out = matmul(query_set_encode, delta_w).squeeze(1) + delta_b # query_size
+        prediction = self.adjust(out, num_samples) + query_set_predict # query_size
+        return prediction, out
